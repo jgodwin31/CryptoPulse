@@ -13,6 +13,7 @@ import dotenv
 from etl.extract_data import fetch_top_coins
 from etl.transform_data import market_list_to_df, compute_volatility_from_series
 from etl.load_data import get_db_engine, init_schema, insert_market_snapshot, DEFAULT_TABLE
+from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +41,13 @@ def compute_volatility_for_df(engine, df: pd.DataFrame, window: int = 24) -> pd.
             # we want oldest to newest, but we limit to recent N (so we do a subquery if needed)
             # simpler: fetch last N and then sort
             recent = conn.execute(
-                f"""
-                SELECT current_price, fetched_at FROM {DEFAULT_TABLE}
-                WHERE symbol = :sym
-                ORDER BY fetched_at DESC
-                LIMIT :limit
-                """, {"sym": sym, "limit": max(window*3, 100)}
+                text(f"""
+                    SELECT current_price, fetched_at FROM {DEFAULT_TABLE}
+                    WHERE symbol = :sym
+                    ORDER BY fetched_at DESC
+                    LIMIT :limit
+                """),
+                {"sym": sym, "limit": max(window * 3, 100)},
             ).fetchall()
             # recent is newest->oldest; convert to pandas Series oldest->newest
             if not recent:
