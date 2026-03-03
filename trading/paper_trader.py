@@ -25,17 +25,21 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from features import compute_features, get_feature_columns, load_price_history
-from model import load_artifacts, predict_latest
-
-import sys, os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ml.features import compute_features, get_feature_columns, load_price_history
 from ml.model import load_artifacts, predict_latest
+
+def _f(v):
+    """Cast numpy scalars to plain Python float for DB compatibility."""
+    return None if v is None else float(v)
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("cryptopulse.trader")
+
+
+
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -134,32 +138,29 @@ class Portfolio:
             }
 
     def _save(self, total_value: float):
-        """Persist portfolio state to DB."""
-        positions_value = total_value - self.cash
+        total_value = float(total_value)
+        positions_value = float(total_value - self.cash)
         with self.engine.begin() as conn:
-            # Upsert portfolio row
             conn.execute(text("""
                 INSERT INTO paper_portfolio (cash, total_value, total_pnl, total_pnl_pct, updated_at)
                 VALUES (:cash, :tv, :pnl, :pnl_pct, NOW())
             """), {
-                "cash":    self.cash,
+                "cash":    float(self.cash),
                 "tv":      total_value,
-                "pnl":     total_value - STARTING_CASH,
-                "pnl_pct": (total_value - STARTING_CASH) / STARTING_CASH * 100,
+                "pnl":     float(total_value - STARTING_CASH),
+                "pnl_pct": float((total_value - STARTING_CASH) / STARTING_CASH * 100),
             })
-            # History snapshot
             conn.execute(text("""
                 INSERT INTO paper_portfolio_history (total_value, cash, positions_value, recorded_at)
                 VALUES (:tv, :cash, :pv, NOW())
-            """), {"tv": total_value, "cash": self.cash, "pv": positions_value})
+            """), {"tv": total_value, "cash": float(self.cash), "pv": positions_value})
 
     def value(self, current_prices: dict) -> float:
-        """Calculate total portfolio value given current prices."""
         positions_val = sum(
-            pos["quantity"] * current_prices.get(sym, pos["entry_price"])
+            float(pos["quantity"]) * float(current_prices.get(sym, pos["entry_price"]))
             for sym, pos in self.positions.items()
         )
-        return self.cash + positions_val
+        return float(self.cash + positions_val)
 
     def buy(self, symbol: str, price: float, signal: str, confidence: float) -> Optional[dict]:
         """
@@ -191,23 +192,23 @@ class Portfolio:
         self.cash -= invest
         self.positions[symbol] = {
             "symbol":      symbol,
-            "quantity":    quantity,
-            "entry_price": price,
-            "entry_cost":  cost,
+            "quantity":    _f(cost / price),
+            "entry_price": _f(price),
+            "entry_cost":  _f(cost),
             "opened_at":   datetime.now(tz=timezone.utc),
         }
 
         trade = {
             "symbol":      symbol,
             "side":        "BUY",
-            "quantity":    quantity,
-            "price":       price,
-            "cost":        invest,
-            "fee":         fee,
+            "quantity":    _f(cost / price),
+            "price":       _f(price),
+            "cost":        _f(invest),
+            "fee":         _f(fee),
             "pnl":         None,
             "pnl_pct":     None,
             "signal":      signal,
-            "confidence":  confidence,
+            "confidence":  _f(confidence),
         }
         self._record_trade(trade)
         self._sync_position(symbol, upsert=True)
@@ -234,14 +235,14 @@ class Portfolio:
         trade = {
             "symbol":     symbol,
             "side":       "SELL",
-            "quantity":   quantity,
-            "price":      price,
-            "cost":       proceeds,
-            "fee":        fee,
-            "pnl":        pnl,
-            "pnl_pct":    pnl_pct,
+            "quantity":   _f(quantity),
+            "price":      _f(price),
+            "cost":       _f(proceeds),
+            "fee":        _f(fee),
+            "pnl":        _f(pnl),
+            "pnl_pct":    _f(pnl_pct),
             "signal":     f"{signal} ({reason})",
-            "confidence": confidence,
+            "confidence": _f(confidence),
         }
         self._record_trade(trade)
         self._sync_position(symbol, upsert=False)

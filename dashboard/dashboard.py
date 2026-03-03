@@ -369,7 +369,7 @@ price_display["Updated"]    = pd.to_datetime(price_display["fetched_at"]).dt.str
 st.dataframe(
     price_display[["symbol", "Price", "24h Change", "24h High", "24h Low", "Volume", "Updated"]]
         .rename(columns={"symbol": "Symbol"}),
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
 )
 
@@ -400,7 +400,7 @@ else:
     st.dataframe(
         sig_display[["symbol", "Price", "Signal", "Confidence", "P(Up)", "P(Down)", "Horizon"]]
             .rename(columns={"symbol": "Symbol"}),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -443,7 +443,7 @@ if sel_symbols:
                 margin=dict(l=0, r=0, t=10, b=0),
                 height=380,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, config={"displayModeBar": False}, use_container_width=True)
 
         with tab2:
             ca, cb = st.columns(2)
@@ -460,7 +460,8 @@ if sel_symbols:
                     base = g["current_price"].iloc[0]
                     g["pct_change"] = (g["current_price"] - base) / base * 100
                     return g
-                cmp_n = cmp.groupby("symbol", group_keys=False).apply(normalise)
+                cmp_n = cmp.groupby("symbol", group_keys=False)[["fetched_at", "current_price", "symbol"]].apply(normalise, include_groups=False)
+                cmp_n["symbol"] = cmp.groupby("symbol", group_keys=False)["symbol"].transform(lambda x: x)
                 fig2 = px.line(
                     cmp_n, x="fetched_at", y="pct_change", color="symbol",
                     labels={"fetched_at": "", "pct_change": "% Change from start", "symbol": ""},
@@ -475,7 +476,7 @@ if sel_symbols:
                     margin=dict(l=0, r=0, t=10, b=0),
                     height=320,
                 )
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, config={"displayModeBar": False}, use_container_width=True)
 
 # ── Portfolio History Chart ────────────────────────────────────────────────────
 
@@ -509,7 +510,7 @@ if not port_hist.empty and len(port_hist) > 1:
         margin=dict(l=0, r=0, t=10, b=0),
         height=300,
     )
-    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(fig3, config={"displayModeBar": False}, use_container_width=True)
 
 # ── Open Positions ─────────────────────────────────────────────────────────────
 
@@ -534,7 +535,7 @@ if not positions.empty:
     pos_fmt["P&L %"]        = pos_fmt["P&L %"].apply(lambda v: f"{v:+.2f}%" if v else "—")
     pos_fmt["Quantity"]     = pos_fmt["Quantity"].apply(lambda v: f"{v:.6f}")
 
-    st.dataframe(pos_fmt, use_container_width=True, hide_index=True)
+    st.dataframe(pos_fmt, width="stretch", hide_index=True)
 
 # ── Trade History ──────────────────────────────────────────────────────────────
 
@@ -554,7 +555,7 @@ if not trades.empty:
     st.dataframe(
         trades_fmt[["symbol", "Side", "Price", "Cost", "Fee", "P&L", "P&L %", "signal", "Time"]]
             .rename(columns={"symbol": "Symbol", "signal": "Signal"}),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
