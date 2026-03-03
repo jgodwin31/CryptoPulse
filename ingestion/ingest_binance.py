@@ -1,14 +1,15 @@
 """
-ingest_binance.py
------------------
-Real-time cryptocurrency price ingestion via Binance WebSocket.
+ingest_kraken.py
+----------------
+Real-time cryptocurrency price ingestion via Kraken WebSocket.
 Streams live ticker data for configured symbols and writes to PostgreSQL.
 
+Kraken WebSocket v2 docs: https://docs.kraken.com/api/docs/websocket-v2/ticker
+
 Usage:
-    python ingest_binance.py
+    python -m ingestion.ingest_kraken
 
 Runs indefinitely. Press Ctrl+C to stop.
-Designed to run alongside (or replace) run_pipeline.py for real-time ingestion.
 """
 
 import asyncio
@@ -16,7 +17,6 @@ import json
 import logging
 import os
 import signal
-import time
 from datetime import datetime, timezone
 from typing import List
 
@@ -32,29 +32,26 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
 )
-logger = logging.getLogger("cryptopulse.binance")
+logger = logging.getLogger("cryptopulse.kraken")
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
 
-# Top coins to track — Binance symbol format (always USDT pairs)
-SYMBOLS: List[str] = [
-    "btcusdt", "ethusdt", "bnbusdt", "solusdt", "xrpusdt",
-    "adausdt", "dogeusdt", "avaxusdt", "linkusdt", "dotusdt"
+# Kraken uses format "BTC/USD" for pairs
+SYMBOLS_KRAKEN = [
+    "BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD",
+    "DOGE/USD", "AVAX/USD", "LINK/USD", "DOT/USD", "MATIC/USD"
 ]
 
-# Binance combined stream endpoint
-# Subscribes to individual symbol mini-tickers (24hr rolling stats + last price)
-BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams="
+# Clean symbol map: "BTC/USD" → "BTC"
+def clean_symbol(pair: str) -> str:
+    return pair.split("/")[0]
 
-# How many rows to buffer before bulk-inserting into Postgres
-BATCH_SIZE = 20
-
-# Reconnect delay on connection drop (seconds)
+KRAKEN_WS_URL  = "wss://ws.kraken.com/v2"
+BATCH_SIZE     = 20
 RECONNECT_DELAY = 5
+TABLE_NAME     = "crypto_market_rt"
 
-TABLE_NAME = "crypto_market_rt"  # separate table from batch pipeline
-
-# ── Database ──────────────────────────────────────────────────────────────────
+# ── Database ───────────────────────────────────────────────────────────────────
 
 def get_engine() -> Engine:
     url = (
@@ -66,21 +63,20 @@ def get_engine() -> Engine:
 
 
 def init_schema(engine: Engine):
-    """Create real-time table if not exists."""
     ddl = f"""
     CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-        id              BIGSERIAL PRIMARY KEY,
-        symbol          TEXT NOT NULL,
-        coin_id         TEXT NOT NULL,
-        fetched_at      TIMESTAMP WITH TIME ZONE NOT NULL,
-        current_price   DOUBLE PRECISION,
+        id               BIGSERIAL PRIMARY KEY,
+        symbol           TEXT NOT NULL,
+        coin_id          TEXT NOT NULL,
+        fetched_at       TIMESTAMP WITH TIME ZONE NOT NULL,
+        current_price    DOUBLE PRECISION,
         price_change_pct DOUBLE PRECISION,
-        high_24h        DOUBLE PRECISION,
-        low_24h         DOUBLE PRECISION,
-        total_volume    DOUBLE PRECISION,
-        market_cap      DOUBLE PRECISION DEFAULT NULL,
+        high_24h         DOUBLE PRECISION,
+        low_24h          DOUBLE PRECISION,
+        total_volume     DOUBLE PRECISION,
+        market_cap       DOUBLE PRECISION DEFAULT NULL,
         volatility_index DOUBLE PRECISION DEFAULT NULL,
-        last_updated    TIMESTAMP WITH TIME ZONE,
+        last_updated     TIMESTAMP WITH TIME ZONE,
         UNIQUE(symbol, fetched_at)
     );
     CREATE INDEX IF NOT EXISTS idx_rt_symbol     ON {TABLE_NAME} (symbol);
@@ -92,11 +88,8 @@ def init_schema(engine: Engine):
 
 
 def bulk_insert(engine: Engine, rows: List[dict]):
-    """Bulk insert buffered rows. Ignores duplicates via ON CONFLICT DO NOTHING."""
     if not rows:
         return
-    df = pd.DataFrame(rows)
-    # Use raw SQL for upsert — pandas to_sql doesn't support ON CONFLICT
     insert_sql = f"""
         INSERT INTO {TABLE_NAME}
             (symbol, coin_id, fetched_at, current_price, price_change_pct,
@@ -110,103 +103,123 @@ def bulk_insert(engine: Engine, rows: List[dict]):
         conn.execute(text(insert_sql), rows)
     logger.info("Inserted %d rows into %s", len(rows), TABLE_NAME)
 
-# ── WebSocket Stream ──────────────────────────────────────────────────────────
+# ── WebSocket ──────────────────────────────────────────────────────────────────
 
-def build_stream_url(symbols: List[str]) -> str:
+def build_subscribe_msg(symbols: List[str]) -> dict:
     """
-    Build Binance combined stream URL.
-    Uses miniTicker streams — lightweight, updates every second per symbol.
+    Kraken v2 subscription message for ticker channel.
     """
-    streams = "/".join(f"{s}@miniTicker" for s in symbols)
-    return BINANCE_WS_BASE + streams
-
-
-def parse_mini_ticker(data: dict) -> dict | None:
-    """
-    Parse a Binance miniTicker message into a DB row dict.
-
-    Binance miniTicker fields:
-        e  - event type ("24hrMiniTicker")
-        E  - event time (ms timestamp)
-        s  - symbol (e.g. "BTCUSDT")
-        c  - close price (current price)
-        o  - open price
-        h  - high price
-        l  - low price
-        v  - base asset volume
-        q  - quote asset volume (USD volume for USDT pairs)
-    """
-    try:
-        stream_data = data.get("data", data)  # handle combined stream wrapper
-        if stream_data.get("e") != "24hrMiniTicker":
-            return None
-
-        symbol_raw = stream_data["s"]  # e.g. "BTCUSDT"
-        symbol = symbol_raw.replace("USDT", "")  # e.g. "BTC"
-        close_price = float(stream_data["c"])
-        open_price  = float(stream_data["o"])
-        high        = float(stream_data["h"])
-        low         = float(stream_data["l"])
-        volume      = float(stream_data["q"])  # quote volume = USD volume
-        event_time  = datetime.fromtimestamp(stream_data["E"] / 1000, tz=timezone.utc)
-
-        # price change % vs open
-        price_change_pct = ((close_price - open_price) / open_price * 100) if open_price else None
-
-        return {
-            "symbol":           symbol,
-            "coin_id":          symbol.lower(),
-            "fetched_at":       datetime.now(tz=timezone.utc),
-            "current_price":    close_price,
-            "price_change_pct": round(price_change_pct, 4) if price_change_pct else None,
-            "high_24h":         high,
-            "low_24h":          low,
-            "total_volume":     volume,
-            "last_updated":     event_time,
+    return {
+        "method": "subscribe",
+        "params": {
+            "channel": "ticker",
+            "symbol":  symbols,
         }
+    }
+
+
+def parse_ticker(msg: dict) -> List[dict]:
+    """
+    Parse a Kraken v2 ticker message into DB row dicts.
+
+    Kraken v2 ticker fields (inside data array):
+        symbol      - e.g. "BTC/USD"
+        last         - last trade price
+        high         - 24h high
+        low          - 24h low
+        volume       - 24h volume (base currency)
+        vwap         - 24h volume-weighted average price
+        change       - price change vs 24h ago
+        change_pct   - % price change vs 24h ago
+    """
+    rows = []
+    try:
+        if msg.get("channel") != "ticker":
+            return rows
+        if msg.get("type") not in ("snapshot", "update"):
+            return rows
+
+        for item in msg.get("data", []):
+            symbol_raw = item.get("symbol", "")        # e.g. "BTC/USD"
+            symbol     = clean_symbol(symbol_raw)       # e.g. "BTC"
+            price      = item.get("last")
+            high       = item.get("high")
+            low        = item.get("low")
+            volume     = item.get("volume")
+            change_pct = item.get("change_pct")
+
+            if price is None:
+                continue
+
+            rows.append({
+                "symbol":           symbol,
+                "coin_id":          symbol.lower(),
+                "fetched_at":       datetime.now(tz=timezone.utc),
+                "current_price":    float(price),
+                "price_change_pct": round(float(change_pct), 4) if change_pct is not None else None,
+                "high_24h":         float(high)   if high   is not None else None,
+                "low_24h":          float(low)    if low    is not None else None,
+                "total_volume":     float(volume) if volume is not None else None,
+                "last_updated":     datetime.now(tz=timezone.utc),
+            })
     except (KeyError, ValueError, TypeError) as e:
-        logger.warning("Failed to parse ticker: %s | raw: %s", e, data)
-        return None
+        logger.warning("Failed to parse ticker: %s | raw: %s", e, msg)
+
+    return rows
 
 
 async def stream(engine: Engine, symbols: List[str]):
     """
-    Main WebSocket coroutine. Connects to Binance, parses tickers,
+    Main WebSocket coroutine. Connects to Kraken, subscribes to ticker,
     buffers rows, and bulk-inserts every BATCH_SIZE messages.
-    Reconnects automatically on disconnect.
+    Auto-reconnects on disconnect.
     """
-    url = build_stream_url(symbols)
+    subscribe_msg = build_subscribe_msg(symbols)
     buffer: List[dict] = []
 
-    logger.info("Connecting to Binance WebSocket: %d symbols", len(symbols))
-    logger.info("Tracking: %s", [s.upper() for s in symbols])
+    logger.info("Connecting to Kraken WebSocket...")
+    logger.info("Tracking: %s", [clean_symbol(s) for s in symbols])
 
-    while True:  # outer reconnect loop
+    while True:
         try:
             async with websockets.connect(
-                url,
+                KRAKEN_WS_URL,
                 ping_interval=20,
                 ping_timeout=10,
                 close_timeout=5,
             ) as ws:
                 logger.info("WebSocket connected ✓")
+
+                # Send subscription
+                await ws.send(json.dumps(subscribe_msg))
+                logger.info("Subscribed to ticker channel for %d pairs", len(symbols))
+
                 async for raw_msg in ws:
                     try:
                         data = json.loads(raw_msg)
                     except json.JSONDecodeError:
-                        logger.warning("Non-JSON message received, skipping")
                         continue
 
-                    row = parse_mini_ticker(data)
-                    if row:
+                    # Log subscription confirmations
+                    if data.get("method") == "subscribe":
+                        if data.get("success"):
+                            logger.info("Subscription confirmed ✓")
+                        else:
+                            logger.warning("Subscription failed: %s", data)
+                        continue
+
+                    # Parse ticker updates
+                    rows = parse_ticker(data)
+                    for row in rows:
                         buffer.append(row)
                         logger.debug(
-                            "%-6s $%-12.4f  Δ24h: %+.2f%%",
-                            row["symbol"], row["current_price"],
+                            "%-8s $%-12.4f  Δ24h: %+.2f%%",
+                            row["symbol"],
+                            row["current_price"],
                             row["price_change_pct"] or 0
                         )
 
-                    # flush buffer to DB
+                    # Flush to DB when buffer is full
                     if len(buffer) >= BATCH_SIZE:
                         try:
                             bulk_insert(engine, buffer)
@@ -222,7 +235,7 @@ async def stream(engine: Engine, symbols: List[str]):
         except Exception as e:
             logger.exception("Unexpected error: %s. Reconnecting in %ds...", e, RECONNECT_DELAY)
 
-        # flush remaining buffer before reconnect
+        # Flush remaining buffer before reconnect
         if buffer:
             try:
                 bulk_insert(engine, buffer)
@@ -232,16 +245,13 @@ async def stream(engine: Engine, symbols: List[str]):
 
         await asyncio.sleep(RECONNECT_DELAY)
 
-# ── Graceful Shutdown ─────────────────────────────────────────────────────────
-
-_shutdown = False
+# ── Graceful Shutdown ──────────────────────────────────────────────────────────
 
 def _handle_signal(sig, frame):
-    global _shutdown
-    logger.info("Shutdown signal received (%s). Stopping...", signal.Signals(sig).name)
-    _shutdown = True
+    logger.info("Shutdown signal received. Stopping...")
+    raise SystemExit(0)
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
+# ── Entry Point ────────────────────────────────────────────────────────────────
 
 async def main():
     signal.signal(signal.SIGINT,  _handle_signal)
@@ -251,11 +261,11 @@ async def main():
     init_schema(engine)
 
     try:
-        await stream(engine, SYMBOLS)
-    except asyncio.CancelledError:
+        await stream(engine, SYMBOLS_KRAKEN)
+    except (asyncio.CancelledError, SystemExit):
         pass
     finally:
-        logger.info("CryptoPulse Binance ingestion stopped.")
+        logger.info("CryptoPulse Kraken ingestion stopped.")
         engine.dispose()
 
 
